@@ -1,344 +1,237 @@
 #include <Arduino.h>
-#include "Config.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
+#include <BLECharacteristic.h>
 #include <WiFi.h>
-#include <ESPmDNS.h>
 #include <Preferences.h>
-#include <WebServer.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include "CurtainControl.h"
 
-// ============= СОСТОЯНИЯ =============
-enum DeviceState { SETUP_BLE, CONNECTING_WIFI, WORKING_WS };
-DeviceState currentState = SETUP_BLE;
+// ============= ПОДКЛЮЧАЕМ МОДУЛИ =============
+#include "MqttManager.h"
+#include "CurtainControl.h"  // <-- ДОБАВИТЬ
 
-// ============= ГЛОБАЛЬНЫЕ ОБЪЕКТЫ =============
+// ============= ПИНЫ =============
+#define LED_PIN 2
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// ============= ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =============
 Preferences preferences;
-WebServer server(80);
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+BLEAdvertising* pAdvertising = nullptr;
 
-unsigned long lastLedBlink = 0;
-bool ledState = false;
+bool bleConnected = false;
+bool wifiConnected = false;
 
-// Индикация подключения приложения
-bool isAppConnected = false;
-unsigned long lastAppActivity = 0;
-const unsigned long APP_TIMEOUT = 10000;
-
-void updateAppActivity() {
-    lastAppActivity = millis();
-    if (!isAppConnected) {
-        isAppConnected = true;
-        Serial.println("📱 Приложение подключено!");
-        for (int i = 0; i < 3; i++) {
-            digitalWrite(LED_PIN, HIGH);
-            delay(100);
-            digitalWrite(LED_PIN, LOW);
-            delay(100);
-        }
+// ============= BLE CALLBACK =============
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        bleConnected = true;
+        Serial.println("[BLE] ✅ Подключено!");
+        digitalWrite(LED_PIN, HIGH);
     }
-}
-
-void checkAppConnection() {
-    if (isAppConnected && (millis() - lastAppActivity > APP_TIMEOUT)) {
-        isAppConnected = false;
-        Serial.println("📱 Приложение отключено (таймаут)");
-    }
-}
-
-// ============= BLE ОБРАБОТЧИК =============
-class MyCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        String value = pCharacteristic->getValue().c_str();
-        if (value.length() > 0) {
-            int sep = value.indexOf(':');
-            if (sep != -1) {
-                String ssid = value.substring(0, sep);
-                String pass = value.substring(sep + 1);
-                
-                Serial.println("📡 Сохраняю настройки WiFi...");
-                preferences.begin("wifi-creds", false);
-                preferences.putString("ssid", ssid);
-                preferences.putString("pass", pass);
-                preferences.end();
-
-                Serial.printf("✅ Получен SSID: %s\n", ssid.c_str());
-                WiFi.begin(ssid.c_str(), pass.c_str());
-                currentState = CONNECTING_WIFI;
-            }
-        }
+    void onDisconnect(BLEServer* pServer) {
+        bleConnected = false;
+        Serial.println("[BLE] ❌ Отключено");
+        BLEDevice::getAdvertising()->start();
     }
 };
 
-// ============= ФУНКЦИИ ДЛЯ ANDROID API =============
-
-void sendCurtainStatus() {
-    CurtainState state = getCurtainStatus();
-    int position = getCurtainPosition();
-    
-    String stateStr;
-    switch(state) {
-        case OPENED: stateStr = "OPENED"; break;
-        case CLOSED: stateStr = "CLOSED"; break;
-        case MOVING: stateStr = "MOVING"; break;
-        default: stateStr = "STOPPED"; break;
-    }
-    
-    JsonDocument doc;
-    doc["status"] = stateStr;
-    doc["position"] = position;
-    doc["is_moving"] = (state == MOVING);
-    
-    String response;
-    serializeJson(doc, response);
-    server.send(200, "application/json", response);
-}
-
-void sendErrorResponse(const String& message) {
-    JsonDocument doc;
-    doc["error"] = message;
-    String response;
-    serializeJson(doc, response);
-    server.send(400, "application/json", response);
-}
-
-// ============= API ОБРАБОТЧИКИ =============
-
-void handlePing() {
-    Serial.println("-> GET /ping");
-    updateAppActivity();
-    server.send(200, "text/plain", "pong");
-}
-
-void handleOpen() {
-    Serial.println("-> GET /open");
-    updateAppActivity();
-    openCurtain();
-    sendCurtainStatus();
-}
-
-void handleClose() {
-    Serial.println("-> GET /close");
-    updateAppActivity();
-    closeCurtain();
-    sendCurtainStatus();
-}
-
-void handleStop() {
-    Serial.println("-> GET /stop");
-    updateAppActivity();
-    stopCurtain();
-    sendCurtainStatus();
-}
-
-void handleStatus() {
-    Serial.println("-> GET /status");
-    updateAppActivity();
-    sendCurtainStatus();
-}
-
-void handleSetPosition() {
-    Serial.println("-> GET /set");
-    updateAppActivity();
-    if (server.hasArg("pos")) {
-        int pos = server.arg("pos").toInt();
-        if (pos < 0 || pos > 100) {
-            sendErrorResponse("Position must be 0-100");
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        String value = pCharacteristic->getValue().c_str();
+        Serial.printf("[BLE] Получено: %s\n", value.c_str());
+        
+        int sep1 = value.indexOf(':');
+        int sep2 = value.indexOf(':', sep1 + 1);
+        
+        String ssid, pass, id;
+        
+        if (sep1 != -1 && sep2 != -1) {
+            ssid = value.substring(0, sep1);
+            pass = value.substring(sep1 + 1, sep2);
+            id = value.substring(sep2 + 1);
+            Serial.printf("[BLE] SSID=%s, ID=%s\n", ssid.c_str(), id.c_str());
+        } else if (sep1 != -1) {
+            ssid = value.substring(0, sep1);
+            pass = value.substring(sep1 + 1);
+            id = "blind_" + String(ESP.getEfuseMac(), HEX);
+            Serial.printf("[BLE] SSID=%s (ID сгенерирован)\n", ssid.c_str());
+        } else {
+            Serial.println("[BLE] ❌ Неверный формат");
+            pCharacteristic->setValue("ERROR");
+            pCharacteristic->notify();
             return;
         }
         
-        Serial.printf("🎯 Установка позиции: %d%%\n", pos);
-        int currentPos = getCurtainPosition();
+        preferences.begin("wifi-creds", false);
+        preferences.putString("ssid", ssid);
+        preferences.putString("pass", pass);
+        preferences.end();
         
-        if (pos > currentPos) {
-            openCurtain();
-        } else if (pos < currentPos) {
-            closeCurtain();
+        if (id.length() > 0) {
+            setMqttDeviceId(id.c_str());
         }
         
-        sendCurtainStatus();
-    } else {
-        sendErrorResponse("Missing position parameter");
+        pCharacteristic->setValue("OK");
+        pCharacteristic->notify();
+        
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        Serial.println("[WiFi] Подключение...");
     }
-}
+};
 
-void handleInfo() {
-    Serial.println("-> GET /info");
-    updateAppActivity();
-    JsonDocument doc;
-    doc["device"] = "Smart Curtain";
-    doc["version"] = "2.0";
-    doc["ip"] = WiFi.localIP().toString();
-    doc["position"] = getCurtainPosition();
-    doc["app_connected"] = isAppConnected;
-    doc["free_heap"] = ESP.getFreeHeap();
+// ============= ГЕНЕРАЦИЯ ID =============
+String getDeviceId() {
+    preferences.begin("device-config", true);
+    String id = preferences.getString("device_id", "");
+    preferences.end();
     
-    String response;
-    serializeJson(doc, response);
-    server.send(200, "application/json", response);
-}
-
-void handleCalibrate() {
-    Serial.println("-> GET /calibrate");
-    updateAppActivity();
-    calibrateCurtain();
-    sendCurtainStatus();
-}
-
-void handleReset() {
-    Serial.println("-> GET /reset");
-    updateAppActivity();
-    resetCurtainSettings();
-    server.send(200, "application/json", "{\"status\":\"resetting\"}");
-    delay(1000);
-    ESP.restart();
-}
-
-void handleNotFound() {
-    Serial.printf("❌ 404: %s\n", server.uri().c_str());
-    server.send(404, "application/json", "{\"error\":\"Not found\"}");
-}
-
-// ============= LED ИНДИКАЦИЯ =============
-void updateLED() {
-    if (currentState == SETUP_BLE) {
-        if (millis() - lastLedBlink > 500) {
-            lastLedBlink = millis();
-            ledState = !ledState;
-            digitalWrite(LED_PIN, ledState);
-        }
-    } else if (currentState == CONNECTING_WIFI) {
-        if (millis() - lastLedBlink > 1000) {
-            lastLedBlink = millis();
-            ledState = !ledState;
-            digitalWrite(LED_PIN, ledState);
-        }
-    } else if (currentState == WORKING_WS) {
-        if (isAppConnected) {
-            digitalWrite(LED_PIN, HIGH);
-        } else {
-            if (millis() - lastLedBlink > 3000) {
-                lastLedBlink = millis();
-                digitalWrite(LED_PIN, HIGH);
-                delay(100);
-                digitalWrite(LED_PIN, LOW);
-            }
-        }
+    if (id.length() == 0) {
+        uint64_t chipId = ESP.getEfuseMac();
+        id = "blind_" + String(chipId, HEX);
+        preferences.begin("device-config", false);
+        preferences.putString("device_id", id);
+        preferences.end();
+        Serial.printf("[Config] ✅ Создан новый ID: %s\n", id.c_str());
+    } else {
+        Serial.printf("[Config] 📥 Загружен ID: %s\n", id.c_str());
     }
+    return id;
 }
 
 // ============= SETUP =============
 void setup() {
     Serial.begin(115200);
     Serial.println("\n╔════════════════════════════════════╗");
-    Serial.println("║     SMART CURTAIN ESP32 v2.0       ║");
+    Serial.println("║   УМНЫЕ ШТОРЫ (МАКЕТ) v5.3       ║");
+    Serial.println("║   BLE ВСЕГДА ВКЛЮЧЕН!              ║");
+    Serial.println("║   МОТОР УПРАВЛЯЕТСЯ ЧЕРЕЗ MQTT   ║");
     Serial.println("╚════════════════════════════════════╝\n");
     
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
     
+    // ============= ИНИЦИАЛИЗАЦИЯ МОТОРА =============
     initCurtain();
-
+    
+    // ============= ЗАГРУЖАЕМ ID =============
+    String deviceId = getDeviceId();
+    Serial.printf("[Config] Device ID: %s\n", deviceId.c_str());
+    
+    // ============= УСТАНАВЛИВАЕМ ID В MqttManager =============
+    setMqttDeviceId(deviceId.c_str());
+    initMqttTopics();
+    initMqttClient();
+    Serial.println("[MQTT] ✅ Инициализирован");
+    
+    // ============= ЗАПУСКАЕМ BLE =============
+    BLEDevice::init("Умные шторы (макет)");
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+    
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+    pCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pCharacteristic->setCallbacks(new MyCallbacks());
+    pCharacteristic->setValue("OK");
+    pService->start();
+    
+    pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->start();
+    
+    Serial.println("[BLE] ✅ Запущен");
+    Serial.println("[BLE] 📛 Имя: Умные шторы (макет)");
+    Serial.printf("[BLE] 🆔 Device ID: %s\n", deviceId.c_str());
+    Serial.println("[BLE] 🔵 Ожидание подключения...");
+    
+    // ============= ПРОВЕРЯЕМ СОХРАНЕННЫЙ WiFi =============
     preferences.begin("wifi-creds", true);
     String savedSsid = preferences.getString("ssid", "");
     String savedPass = preferences.getString("pass", "");
     preferences.end();
-
+    
     if (savedSsid.length() > 0 && savedPass.length() > 0) {
-        Serial.printf("📡 Найдены сохраненные настройки: %s\n", savedSsid.c_str());
+        Serial.printf("[WiFi] 📡 Найден сохраненный WiFi: %s\n", savedSsid.c_str());
         WiFi.begin(savedSsid.c_str(), savedPass.c_str());
-        currentState = CONNECTING_WIFI;
     } else {
-        Serial.println("⚠️ Нет сохраненных настроек. Запуск BLE...");
-        BLEDevice::init("SmartCurtain");
-        BLEServer *pServer = BLEDevice::createServer();
-        BLEService *pService = pServer->createService(SERVICE_UUID);
-        
-        BLECharacteristic *pChar = pService->createCharacteristic(
-            CHARACTERISTIC_UUID,
-            BLECharacteristic::PROPERTY_WRITE
-        );
-        
-        pChar->setCallbacks(new MyCallbacks());
-        pService->start();
-        BLEDevice::getAdvertising()->start();
-        
-        Serial.println("🔵 BLE запущен. Жду конфигурацию...");
-        currentState = SETUP_BLE;
+        Serial.println("[WiFi] ⚠️ Нет сохраненных настроек");
     }
 }
 
 // ============= LOOP =============
 void loop() {
-    updateLED();
+    static unsigned long lastBlink = 0;
+    static bool ledState = false;
+    static unsigned long wifiStartTime = 0;
+    static bool wifiConnecting = false;
     
-    if (currentState == SETUP_BLE) {
-        delay(100);
-        return;
+    // ============= ОБНОВЛЕНИЕ МОТОРА (КРИТИЧЕСКИ ВАЖНО!) =============
+    updateCurtain();
+    
+    // ============= MQTT =============
+    if (wifiConnected) {
+        mqttLoop();
     }
-
-    if (currentState == CONNECTING_WIFI) {
-        static unsigned long lastPrint = 0;
-        static unsigned long wifiStartTime = millis();
-        
-        if (millis() - lastPrint > 1000) {
-            lastPrint = millis();
-            Serial.print(".");
-        }
-        
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("\n✅ WiFi подключен!");
-            Serial.print("📡 IP: ");
+    
+    // ============= ОБРАБОТКА WiFi =============
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!wifiConnected) {
+            wifiConnected = true;
+            wifiConnecting = false;
+            Serial.println("[WiFi] ✅ Подключен!");
+            Serial.print("[WiFi] 📡 IP: ");
             Serial.println(WiFi.localIP());
-
-            if (MDNS.begin("smart-curtain")) {
-                Serial.println("✅ mDNS: smart-curtain.local");
-                MDNS.addService("http", "tcp", 80);
-            }
-
-            server.on("/ping", handlePing);
-            server.on("/open", handleOpen);
-            server.on("/close", handleClose);
-            server.on("/stop", handleStop);
-            server.on("/status", handleStatus);
-            server.on("/set", handleSetPosition);
-            server.on("/info", handleInfo);
-            server.on("/calibrate", handleCalibrate);
-            server.on("/reset", handleReset);
-            server.onNotFound(handleNotFound);
-            
-            server.begin();
-            Serial.println("🌐 HTTP сервер запущен!");
-            Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-            Serial.println("Доступные API:");
-            Serial.println("  GET /ping      - проверка связи");
-            Serial.println("  GET /open      - открыть штору");
-            Serial.println("  GET /close     - закрыть штору");
-            Serial.println("  GET /stop      - остановить");
-            Serial.println("  GET /status    - получить статус");
-            Serial.println("  GET /set?pos=N - установить позицию N%");
-            Serial.println("  GET /info      - информация об устройстве");
-            Serial.println("  GET /calibrate - калибровка штор");
-            Serial.println("  GET /reset     - сброс настроек");
-            Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-            currentState = WORKING_WS;
+            Serial.printf("[WiFi] 🆔 Device ID: %s\n", deviceId.c_str());
+            reconnectMqtt();
+        }
+    } else {
+        if (wifiConnected) {
+            wifiConnected = false;
+            Serial.println("[WiFi] ❌ Соединение потеряно");
         }
         
-        if (millis() - wifiStartTime > 30000 && WiFi.status() != WL_CONNECTED) {
-            Serial.println("\n❌ Таймаут подключения к Wi-Fi");
+        if (!wifiConnecting) {
+            preferences.begin("wifi-creds", true);
+            String savedSsid = preferences.getString("ssid", "");
+            String savedPass = preferences.getString("pass", "");
+            preferences.end();
+            
+            if (savedSsid.length() > 0 && savedPass.length() > 0) {
+                wifiConnecting = true;
+                wifiStartTime = millis();
+                WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+                Serial.println("[WiFi] 🔄 Попытка подключения...");
+            }
+        }
+        
+        if (wifiConnecting && (millis() - wifiStartTime > 30000)) {
+            wifiConnecting = false;
+            Serial.println("[WiFi] ❌ Таймаут подключения");
             preferences.begin("wifi-creds", false);
             preferences.clear();
             preferences.end();
+            Serial.println("[WiFi] 🗑️ Настройки сброшены");
             ESP.restart();
         }
     }
-
-    if (currentState == WORKING_WS) {
-        server.handleClient();
-        updateCurtain();
-        checkAppConnection();
+    
+    // ============= LED ИНДИКАЦИЯ =============
+    if (bleConnected) {
+        digitalWrite(LED_PIN, HIGH);
+    } else {
+        if (millis() - lastBlink > 500) {
+            lastBlink = millis();
+            ledState = !ledState;
+            digitalWrite(LED_PIN, ledState);
+        }
     }
     
-    delay(5);
+    delay(10);
 }
